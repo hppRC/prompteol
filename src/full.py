@@ -5,11 +5,9 @@ from dataclasses import dataclass
 
 import datasets as ds
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from mteb import MTEB
-from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import (
     AutoModel,
@@ -33,7 +31,7 @@ class Batch:
 class Args(TrainingArguments):
     output_dir: str = None
     data_path: str = "data/nli_for_simcse.csv"
-    model_name: str = "meta-llama/Llama-2-7b-hf"
+    model_name: str = "facebook/opt-125m"
 
     learning_rate: float = 5e-4
     num_train_epochs: int = 1
@@ -42,20 +40,15 @@ class Args(TrainingArguments):
     temperature: float = 0.05
 
     max_seq_len: int = 32
-    num_bits: int = 4
-
-    lora_r: int = 64
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
 
     logging_steps: int = 10
     bf16: bool = True
 
     evaluation_strategy: str = "steps"
-    eval_steps: int = 10
+    eval_steps: int = 100
 
     save_strategy: str = "steps"
-    save_steps: int = 10
+    save_steps: int = 100
     save_total_limit: int = 1
 
     gradient_checkpointing: bool = True
@@ -64,7 +57,7 @@ class Args(TrainingArguments):
     report_to: str = "none"
     ddp_find_unused_parameters: bool = False
 
-    load_best_model_at_end: bool = False  # This is importnant for preventing hangup
+    load_best_model_at_end: bool = False
     remove_unused_columns: bool = False
     metric_for_best_model: str = "spearman"
 
@@ -81,8 +74,8 @@ class DataCollator:
         texts = [self.template.format(text=t) for t in texts]
         return self.tokenizer(
             texts,
-            truncation=True,
             padding="max_length",  # fix tensor's shape for performance with `torch.compile``
+            truncation=True,
             return_tensors="pt",
             max_length=self.max_seq_len,
         )
@@ -110,7 +103,7 @@ class Trainer(HFTrainer):
         gathered[batch_size * pid : batch_size * (pid + 1)] = x
         return gathered
 
-    @torch.compile
+    @torch.compile()
     def calc_loss(self, anc: torch.Tensor, pos: torch.Tensor, neg: torch.Tensor) -> torch.Tensor:
         sim_mat_1st = F.cosine_similarity(anc.unsqueeze(1), pos.unsqueeze(0), dim=-1)
         sim_mat_2nd = F.cosine_similarity(anc.unsqueeze(1), neg.unsqueeze(0), dim=-1)
@@ -131,8 +124,6 @@ class Trainer(HFTrainer):
         pos: torch.Tensor = model(**inputs.pos).last_hidden_state[:, -1]
         neg: torch.Tensor = model(**inputs.neg).last_hidden_state[:, -1]
 
-        # gather from all processes
-        # if you have 2 GPUs, anc, pos, and neg will be of size (batch_size * 2, dim)
         anc = self.gather_and_replace(anc)
         pos = self.gather_and_replace(pos)
         neg = self.gather_and_replace(neg)
@@ -183,19 +174,6 @@ class Trainer(HFTrainer):
             self.save_model(args.output_dir)
 
 
-def find_all_linear_names(model: nn.Module, num_bits: int) -> list[str]:
-    lora_module_names = set()
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            names = name.split(".")
-            lora_module_names.add(names[-1])
-
-    if "lm_head" in lora_module_names:  # needed for 16-bit
-        lora_module_names.remove("lm_head")
-
-    return sorted(list(lora_module_names))
-
-
 def main(args: Args):
     use_cache = not args.gradient_checkpointing
     model: PreTrainedModel = AutoModel.from_pretrained(
@@ -205,21 +183,9 @@ def main(args: Args):
     )
     model.config.use_cache = use_cache
 
-    target_modules = find_all_linear_names(model, args.num_bits)
-
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
-        inference_mode=False,
-    )
-
     # we can compile our model only with `use_reentrant=False`
     if not args.gradient_checkpointing_use_reentrant:
         model = torch.compile(model)
-    model = get_peft_model(model, lora_config)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="left")
     if tokenizer.pad_token is None:
@@ -239,7 +205,6 @@ def main(args: Args):
         train_dataset=train_dataset,
         data_collator=data_collator,
     )
-
     trainer.train()
     trainer.save_best_model()
 
@@ -250,9 +215,10 @@ if __name__ == "__main__":
 
     parser = HfArgumentParser(Args)
     args: Args = parser.parse_args_into_dataclasses()[0]
+
     if args.output_dir is None:
         model_name = args.model_name.replace("/", "__")
-        args.output_dir = f"outputs/{model_name}/lora"
+        args.output_dir = f"outputs/{model_name}/full"
 
     # monkey patching
     original_checkpoint = torch.utils.checkpoint.checkpoint

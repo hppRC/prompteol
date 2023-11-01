@@ -24,7 +24,6 @@ from transformers import (
     TrainingArguments,
 )
 from transformers import Trainer as HFTrainer
-from transformers.trainer_utils import TrainOutput
 
 
 class Batch:
@@ -37,12 +36,11 @@ class Batch:
 class Args(TrainingArguments):
     output_dir: str = None
     data_path: str = "data/nli_for_simcse.csv"
-    # model_name: str = "meta-llama/Llama-2-7b-hf"
-    model_name: str = "facebook/opt-125m"
+    model_name: str = "meta-llama/Llama-2-7b-hf"
 
     learning_rate: float = 5e-4
     num_train_epochs: int = 1
-    per_device_train_batch_size: int = 1024
+    per_device_train_batch_size: int = 128
     warmup_ratio: float = 0.1
     temperature: float = 0.05
 
@@ -63,11 +61,12 @@ class Args(TrainingArguments):
     save_steps: int = 10
     save_total_limit: int = 1
     gradient_checkpointing: bool = True
+    gradient_checkpointing_use_reentrant: bool = True
 
     report_to: str = "none"
     ddp_find_unused_parameters: bool = False
 
-    load_best_model_at_end: bool = True
+    load_best_model_at_end: bool = False  # This is importnant for preventing hangup
     remove_unused_columns: bool = False
     metric_for_best_model: str = "spearman"
 
@@ -84,9 +83,8 @@ class DataCollator:
         texts = [self.template.format(text=t) for t in texts]
         return self.tokenizer(
             texts,
-            # padding=True,
             truncation=True,
-            padding="max_length", # fix tensor's shape for performance with `torch.compile``
+            padding="max_length",  # fix tensor's shape for performance with `torch.compile``
             return_tensors="pt",
             max_length=self.max_seq_len,
         )
@@ -114,7 +112,7 @@ class Trainer(HFTrainer):
         gathered[batch_size * pid : batch_size * (pid + 1)] = x
         return gathered
 
-    @torch.compile(mode="max-autotune")
+    @torch.compile
     def calc_loss(self, anc: torch.Tensor, pos: torch.Tensor, neg: torch.Tensor) -> torch.Tensor:
         sim_mat_1st = F.cosine_similarity(anc.unsqueeze(1), pos.unsqueeze(0), dim=-1)
         sim_mat_2nd = F.cosine_similarity(anc.unsqueeze(1), neg.unsqueeze(0), dim=-1)
@@ -136,7 +134,7 @@ class Trainer(HFTrainer):
         neg: torch.Tensor = model(**inputs.neg).last_hidden_state[:, -1]
 
         # gather from all processes
-        # if you have 2 GPUs, pos and neg will be of size batch_size * 2
+        # if you have 2 GPUs, anc, pos, and neg will be of size (batch_size * 2, dim)
         anc = self.gather_and_replace(anc)
         pos = self.gather_and_replace(pos)
         neg = self.gather_and_replace(neg)
@@ -145,7 +143,7 @@ class Trainer(HFTrainer):
 
         return (loss, anc) if return_outputs else loss
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate(self, **kwargs):
         if self.accelerator.is_main_process:
             mteb = MTEB(tasks=["STSBenchmark"])
@@ -153,19 +151,21 @@ class Trainer(HFTrainer):
 
             try:
                 result = mteb.run(self, eval_splits=["validation"], output_folder=None, verbosity=0)
-                metrics = {"eval_spearman": result["STSBenchmark"]["validation"]["cos_sim"]["spearman"]}
+                metrics = {
+                    "eval_spearman": result["STSBenchmark"]["validation"]["cos_sim"]["spearman"]
+                }
             except Exception:
                 metrics = {"eval_spearman": 0.0}
 
             self.log(metrics)
             return metrics
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode(self, sentences: list[str], **kwargs):
         data_loader = DataLoader(
             sentences,
             collate_fn=self.data_collator.process,
-            batch_size=self.args.per_device_train_batch_size,
+            batch_size=64,
             num_workers=0,
             pin_memory=True,
         )
@@ -178,6 +178,11 @@ class Trainer(HFTrainer):
             embs.append(emb.cpu().float())
         embs = torch.cat(embs, dim=0)
         return embs
+
+    def save_best_model(self):
+        if self.accelerator.is_main_process:
+            self._load_best_model()
+            self.save_model(args.output_dir)
 
 
 def find_all_linear_names(model: nn.Module, num_bits: int) -> list[str]:
@@ -224,7 +229,9 @@ def main(args: Args):
     )
     model.config.use_cache = use_cache
 
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=args.gradient_checkpointing
+    )
     target_modules = find_all_linear_names(model, args.num_bits)
 
     lora_config = LoraConfig(
@@ -236,21 +243,28 @@ def main(args: Args):
         inference_mode=False,
     )
 
+    # we can compile our model only with `use_reentrant=False`
+    if not args.gradient_checkpointing_use_reentrant:
+        model = torch.compile(model)
     model = get_peft_model(model, lora_config)
 
+    # torch.float16 may cause NaNs, so we avoid it.
+    lora_dtype = torch.bfloat16 if args.bf16 else torch.float32
     for name, module in model.named_modules():
         if isinstance(module, LoraLayer):
-            module = module.to(torch.bfloat16)
+            module = module.to(lora_dtype)
         elif "norm" in name:
-            module = module.to(torch.bfloat16)
+            module = module.to(lora_dtype)
         elif "lm_head" in name or isinstance(module, nn.Embedding):
-            module = module.to(torch.bfloat16)
+            module = module.to(lora_dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="left")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    train_dataset: ds.Dataset = ds.load_dataset("csv", data_files=args.data_path, split="train").shuffle()
+    train_dataset: ds.Dataset = ds.load_dataset(
+        "csv", data_files=args.data_path, split="train"
+    ).shuffle()
     data_collator = DataCollator(
         tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
@@ -262,23 +276,32 @@ def main(args: Args):
         train_dataset=train_dataset,
         data_collator=data_collator,
     )
-    output: TrainOutput = trainer.train()
-    trainer.save_model(args.output_dir)
+    trainer.train()
+    trainer.save_best_model()
 
 
 if __name__ == "__main__":
-    # logging.disable(logging.FATAL)
-    # warnings.filterwarnings("ignore")
+    logging.disable(logging.FATAL)
+    warnings.filterwarnings("ignore")
 
     parser = HfArgumentParser(Args)
     args: Args = parser.parse_args_into_dataclasses()[0]
-    model_name = args.model_name.replace("/", "__")
-    args.output_dir = f"outputs/{model_name}"
+    if args.output_dir is None:
+        model_name = args.model_name.replace("/", "__")
+        args.output_dir = f"outputs/{model_name}/qlora"
 
     # monkey patching
     original_checkpoint = torch.utils.checkpoint.checkpoint
+    use_reentrant = args.gradient_checkpointing_use_reentrant
+
     def checkpoint(*args, use_reentrant=False, **kwargs):
-        return original_checkpoint(*args, **kwargs, use_reentrant=True)
+        return original_checkpoint(*args, **kwargs, use_reentrant=use_reentrant)
+
     torch.utils.checkpoint.checkpoint = checkpoint
+
+    # to prevent too many re-compiling
+    import torch._dynamo.config
+
+    torch._dynamo.config.cache_size_limit = 4
 
     main(args)
