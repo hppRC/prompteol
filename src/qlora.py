@@ -50,7 +50,7 @@ class Args(TrainingArguments):
     lora_r: int = 64
     lora_alpha: int = 16
     lora_dropout: float = 0.05
-    neftune_noise_alpha: float = 5.0
+    # neftune_noise_alpha: float = 5.0
 
     logging_steps: int = 10
     bf16: bool = True
