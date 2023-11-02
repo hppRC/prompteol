@@ -42,7 +42,6 @@ class Args(TrainingArguments):
     temperature: float = 0.05
 
     max_seq_len: int = 32
-    num_bits: int = 4
 
     lora_r: int = 64
     lora_alpha: int = 16
