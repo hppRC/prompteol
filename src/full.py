@@ -160,10 +160,11 @@ class Trainer(HFTrainer):
         )
 
         model: PreTrainedModel = self.accelerator.unwrap_model(self.model).eval()
+        device = self.accelerator.device
 
         embs = []
         for batch in data_loader:
-            emb = model(**batch.to("cuda:0")).last_hidden_state[:, -1]
+            emb = model(**batch.to(device)).last_hidden_state[:, -1]
             embs.append(emb.cpu().float())
         embs = torch.cat(embs, dim=0)
         return embs

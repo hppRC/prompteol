@@ -70,7 +70,7 @@ tokenizers==0.14.1
 torch==2.1.0+cu118
 torchvision==0.16.0+cu118
 tqdm==4.66.1
-transformers==4.34.1
+transformers @ git+https://github.com/huggingface/transformers
 triton==2.1.0
 typed-argument-parser==1.8.1
 typing-extensions==4.8.0

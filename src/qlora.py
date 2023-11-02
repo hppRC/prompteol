@@ -40,7 +40,7 @@ class Args(TrainingArguments):
 
     learning_rate: float = 5e-4
     num_train_epochs: int = 1
-    per_device_train_batch_size: int = 128
+    per_device_train_batch_size: int = 512
     warmup_ratio: float = 0.1
     temperature: float = 0.05
 
@@ -50,6 +50,7 @@ class Args(TrainingArguments):
     lora_r: int = 64
     lora_alpha: int = 16
     lora_dropout: float = 0.05
+    neftune_noise_alpha: float = 5.0
 
     logging_steps: int = 10
     bf16: bool = True
@@ -171,10 +172,11 @@ class Trainer(HFTrainer):
         )
 
         model: PreTrainedModel = self.accelerator.unwrap_model(self.model).eval()
+        device = self.accelerator.device
 
         embs = []
         for batch in data_loader:
-            emb = model(**batch.to("cuda:0")).last_hidden_state[:, -1]
+            emb = model(**batch.to(device)).last_hidden_state[:, -1]
             embs.append(emb.cpu().float())
         embs = torch.cat(embs, dim=0)
         return embs
